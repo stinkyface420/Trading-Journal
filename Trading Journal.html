@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Trading Journal</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet"/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0e1017; font-family: 'DM Sans', sans-serif; color: #f0f2ff; }
+    button { font-family: inherit; cursor: pointer; }
+    input  { font-family: inherit; }
+    input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.6); cursor: pointer; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0e1017; }
+    ::-webkit-scrollbar-thumb { background: #252836; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useMemo, useCallback, useRef } = React;
+
+    const C = {
+      bg: "#0e1017", card: "#13161f", cardBorder: "#252836",
+      green: "#00d4a0", red: "#ff5e6c", purple: "#7c6af7",
+      blue: "#4a9eff", amber: "#f5a742", yellow: "#f5c542",
+      t1: "#f0f2ff", t2: "#c8cce0", t3: "#8b90aa", t4: "#565a72",
+    };
+
+    const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+    const DAYS   = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+    const QUICK_PAIRS = ["BTCUSD","ETHUSD","XAUUSD","XAGUSD","US30","NAS100","SPX500"];
+
+    const fmtK = (n) => {
+      const abs = Math.abs(n);
+      const sign = n < 0 ? "-$" : "+$";
+      if (abs >= 1000) return `${sign}${(abs/1000).toFixed(2)}K`;
+      return `${sign}${abs.toFixed(2)}`;
+    };
+    const fmtPlain = (n) => `${n < 0 ? "-$" : "$"}${Math.abs(n).toFixed(2)}`;
+
+    // ── CSV Parser ────────────────────────────────────────────────────────
+    function parseStatement(text, excludedMarkets = []) {
+      const excluded = excludedMarkets.map(m => m.toUpperCase());
+      // Normalise line endings and strip BOM
+      const normalised = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/^\uFEFF/, "");
+      const lines = normalised.trim().split("\n").filter(l => l.trim() && !l.startsWith("sep="));
+      if (lines.length < 2) return null;
+
+      const sep = lines[0].includes("\t") ? "\t" : ",";
+      // Strip \r and quotes from every value
+      const clean = v => v.replace(/\r/g, "").trim().replace(/^"|"$/g, "");
+      const headers = lines[0].split(sep).map(h => clean(h).toLowerCase());
+      const rows = lines.slice(1).map(line => {
+        const vals = line.split(sep).map(clean);
+        const obj = {};
+        headers.forEach((h,i) => obj[h] = vals[i] ?? "");
+        return obj;
+      });
+
+      let openingBalance = 0;
+      const trades = [];
+      const financing = [];
+      const openTrades = {};
+
+      rows.forEach(row => {
+        const type    = (row["type"] || "").toLowerCase();
+        const desc    = (row["description"] || "").toLowerCase();
+        const market  = (row["market"] || "").toUpperCase();
+        const amount  = parseFloat(row["amount"]) || 0;
+        const ref     = row["reference"] || "";
+        // Normalise date to ISO format YYYY-MM-DD (brokers may use / or .)
+        const rawTime = row["time"] || "";
+        const dateISO = rawTime.slice(0,10).replace(/[\/\.]/g, "-");
+
+        // Opening balance (type is empty, desc = "opening balance")
+        if (desc === "opening balance") { openingBalance += amount; return; }
+        // Deposit (type = "deposit" OR desc = "deposit")
+        if (type === "deposit" || desc === "deposit") { openingBalance += amount; return; }
+        // Closing balance — skip
+        if (desc === "closing balance" || type === "closing balance") return;
+        // Financing
+        if (type === "financing") { financing.push({ date: dateISO, amount }); return; }
+        // Skip excluded markets
+        if (excluded.includes(market)) return;
+
+        if (type === "open") {
+          openTrades[ref] = { market, lots: parseFloat(row["lots"]) || 0, dir: desc === "buy" ? "Buy" : "Sell" };
+        }
+        if (type === "close" && ref && openTrades[ref]) {
+          const open = openTrades[ref];
+          trades.push({ date: dateISO, market: open.market, lots: open.lots, dir: open.dir, pnl: amount });
+          delete openTrades[ref];
+        }
+      });
+
+      return { openingBalance, trades, financing };
+    }
+
+    // Build aggregated data — applies optional date range filter
+    function buildJournalData(statements, startDate = "", endDate = "") {
+      let allTrades    = statements.flatMap(s => s.trades);
+      let allFinancing = statements.flatMap(s => s.financing);
+      const openingBalance = statements.reduce((s, st) => s + st.openingBalance, 0);
+
+      // Apply date filters
+      if (startDate) {
+        allTrades    = allTrades.filter(t => t.date >= startDate);
+        allFinancing = allFinancing.filter(f => f.date >= startDate);
+      }
+      if (endDate) {
+        allTrades    = allTrades.filter(t => t.date <= endDate);
+        allFinancing = allFinancing.filter(f => f.date <= endDate);
+      }
+
+      const dayMap = {};
+      const ensure = (k) => { if (!dayMap[k]) dayMap[k] = { pnl:0, trades:0, markets:[] }; };
+      allTrades.forEach(t => {
+        ensure(t.date);
+        dayMap[t.date].pnl += t.pnl;
+        dayMap[t.date].trades += 1;
+        if (!dayMap[t.date].markets.includes(t.market)) dayMap[t.date].markets.push(t.market);
+      });
+      allFinancing.forEach(f => { ensure(f.date); dayMap[f.date].pnl += f.amount; });
+
+      let cum = openingBalance;
+      const cumLine = Object.keys(dayMap).sort().map(d => {
+        cum += dayMap[d].pnl;
+        return { date: d, bal: parseFloat(cum.toFixed(2)) };
+      });
+
+      const firstDate = Object.keys(dayMap).sort()[0] || null;
+      const initMonth = firstDate ? parseInt(firstDate.slice(5,7)) - 1 : new Date().getMonth();
+      const initYear  = firstDate ? parseInt(firstDate.slice(0,4))     : new Date().getFullYear();
+
+      return { dayMap, cumLine, trades: allTrades, openingBalance, initMonth, initYear };
+    }
+
+    // ── SparkLine ─────────────────────────────────────────────────────────
+    function SparkLine({ data, openingBalance }) {
+      if (!data.length) return <div style={{ height:120, display:"flex", alignItems:"center", justifyContent:"center", color:C.t4, fontSize:12 }}>No data</div>;
+      const vals = data.map(d => d.bal);
+      const allVals = [openingBalance, ...vals];
+      const min = Math.min(...allVals) * 0.994;
+      const max = Math.max(...allVals) * 1.006;
+      const range = max - min || 1;
+      const W = 300, H = 90;
+      const allPts = [openingBalance, ...vals];
+      const pts = allPts.map((v,i) => `${(i/(allPts.length-1||1))*W},${H-((v-min)/range)*H}`);
+      const lineColor = vals[vals.length-1] >= openingBalance ? C.green : C.red;
+      return (
+        <div>
+          <svg width="100%" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ display:"block", height:120 }}>
+            <defs>
+              <linearGradient id="sg" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={lineColor} stopOpacity="0.4"/>
+                <stop offset="100%" stopColor={lineColor} stopOpacity="0.02"/>
+              </linearGradient>
+            </defs>
+            <path d={`M0,${H} L${pts.join(" L")} L${W},${H} Z`} fill="url(#sg)"/>
+            <path d={`M${pts.join(" L")}`} fill="none" stroke={lineColor} strokeWidth={2.5} strokeLinejoin="round"/>
+            {allPts.map((v,i) => <circle key={i} cx={(i/(allPts.length-1||1))*W} cy={H-((v-min)/range)*H} r={3} fill={lineColor}/>)}
+          </svg>
+          <div style={{ display:"flex", justifyContent:"space-between", marginTop:10 }}>
+            <div style={{ fontSize:10, textAlign:"center" }}>
+              <div style={{ color:C.t3 }}>Start</div>
+              <div style={{ color:C.t2, fontFamily:"'JetBrains Mono',monospace", fontWeight:700 }}>${openingBalance.toFixed(0)}</div>
+            </div>
+            {data.map((d,i) => (
+              <div key={i} style={{ fontSize:10, textAlign:"center" }}>
+                <div style={{ color:C.t3 }}>{d.date.slice(5)}</div>
+                <div style={{ color:i===0||d.bal>=data[i-1].bal?C.green:C.red, fontFamily:"'JetBrains Mono',monospace", fontWeight:700 }}>${d.bal.toFixed(0)}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ── Radar ─────────────────────────────────────────────────────────────
+    function RadarChart({ scores }) {
+      const labels = ["Win %","Prof.Factor","Consistency","Avg W/L","Drawdown","Recovery"];
+      const n = labels.length;
+      const cx=75, cy=75, r=55;
+      const ang = (i) => (i/n)*2*Math.PI - Math.PI/2;
+      const pts = scores.map((s,i) => ({ x:cx+r*(s/100)*Math.cos(ang(i)), y:cy+r*(s/100)*Math.sin(ang(i)) }));
+      const grid = [0.25,0.5,0.75,1].map(p => Array.from({length:n},(_,i)=>`${cx+r*p*Math.cos(ang(i))},${cy+r*p*Math.sin(ang(i))}`).join(" "));
+      const labelPts = Array.from({length:n},(_,i)=>({ x:cx+(r+16)*Math.cos(ang(i)), y:cy+(r+16)*Math.sin(ang(i)), label:labels[i] }));
+      const zellaScore = Math.round(scores.reduce((a,b)=>a+b,0)/n);
+      return (
+        <div style={{ display:"flex", flexDirection:"column", alignItems:"center" }}>
+          <svg width={250} height={250} viewBox="0 0 150 150">
+            {grid.map((g,i) => <polygon key={i} points={g} fill="none" stroke="#252836" strokeWidth={1}/>)}
+            {Array.from({length:n},(_,i) => <line key={i} x1={cx} y1={cy} x2={cx+r*Math.cos(ang(i))} y2={cy+r*Math.sin(ang(i))} stroke="#252836" strokeWidth={1}/>)}
+            <polygon points={pts.map(p=>`${p.x},${p.y}`).join(" ")} fill="rgba(124,106,247,0.18)" stroke={C.purple} strokeWidth={2}/>
+            {pts.map((p,i) => <circle key={i} cx={p.x} cy={p.y} r={3} fill={C.purple}/>)}
+            {labelPts.map((p,i) => <text key={i} x={p.x} y={p.y} textAnchor="middle" dominantBaseline="middle" fontSize={8} fontWeight={600} fill={C.t3}>{p.label}</text>)}
+          </svg>
+          <div style={{ fontSize:11, color:C.t3, marginTop:-4, letterSpacing:"0.12em" }}>ZELLA SCORE</div>
+          <div style={{ fontSize:38, fontWeight:800, color:C.purple, fontFamily:"'JetBrains Mono',monospace", lineHeight:1.1 }}>{zellaScore}</div>
+          <div style={{ height:6, width:180, background:`linear-gradient(90deg,${C.red},${C.yellow},${C.green})`, borderRadius:3, marginTop:10 }}/>
+          <div style={{ display:"flex", justifyContent:"space-between", width:180, fontSize:10, color:C.t3, marginTop:4 }}>
+            <span>0</span><span>50</span><span>100</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Calendar Cell ─────────────────────────────────────────────────────
+    function CalendarCell({ day, data, isToday }) {
+      if (!day) return <div style={{ minHeight:72, height:"100%", borderRadius:8 }}/>;
+      const pnl = data?.pnl ?? null;
+      const hasTrade = data?.trades > 0;
+      const isGreen = pnl > 0, isRed = pnl < 0;
+      return (
+        <div style={{
+          background: hasTrade?(isGreen?"rgba(0,212,160,0.09)":isRed?"rgba(255,94,108,0.1)":C.card):"#111318",
+          border: isToday?`1px solid ${C.purple}`:`1px solid ${hasTrade?(isGreen?"rgba(0,212,160,0.22)":"rgba(255,94,108,0.22)"):"#1a1d26"}`,
+          borderRadius:8, minHeight:72, height:"100%", padding:"6px 8px", display:"flex", flexDirection:"column", justifyContent:"space-between"
+        }}>
+          <div style={{ fontSize:11, color:isToday?C.purple:C.t3, fontWeight:isToday?700:500 }}>{day}</div>
+          {pnl !== null && (
+            <div>
+              <div style={{ fontSize:13, fontWeight:700, color:isGreen?C.green:C.red, fontFamily:"'JetBrains Mono',monospace" }}>{fmtK(pnl)}</div>
+              {hasTrade && <div style={{ fontSize:9, color:C.t3, marginTop:1 }}>{data.trades} trade{data.trades!==1?"s":""}</div>}
+              {data.markets?.length>0 && <div style={{ fontSize:8, color:C.t4, marginTop:1 }}>{data.markets.join(", ")}</div>}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── Shared: Exclude Pairs Panel ───────────────────────────────────────
+    function ExcludePanel({ excluded, setExcluded }) {
+      const [inputVal, setInputVal] = useState("");
+      const addPair = (pair) => {
+        const clean = pair.trim().toUpperCase().replace(/[^A-Z0-9]/g,"");
+        if (clean && !excluded.includes(clean)) setExcluded(prev => [...prev, clean]);
+        setInputVal("");
+      };
+      const removePair = (pair) => setExcluded(prev => prev.filter(p => p !== pair));
+      return (
+        <div style={{ background:C.card, border:`1px solid ${C.cardBorder}`, borderRadius:14, padding:"18px 20px" }}>
+          <div style={{ fontSize:11, color:C.t3, textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:12, fontWeight:600 }}>
+            Exclude Pairs <span style={{ color:C.t4, fontWeight:400, textTransform:"none", letterSpacing:0 }}>(optional)</span>
+          </div>
+          <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:12 }}>
+            {QUICK_PAIRS.map(p => {
+              const active = excluded.includes(p);
+              return (
+                <button key={p} onClick={()=> active ? removePair(p) : addPair(p)} style={{
+                  background: active?"rgba(124,106,247,0.2)":"#1a1d26",
+                  border:`1px solid ${active?C.purple:C.cardBorder}`,
+                  color: active?C.purple:C.t3,
+                  borderRadius:6, padding:"4px 10px", fontSize:11, fontWeight:600, transition:"all 0.15s"
+                }}>
+                  {active?"✕ ":"+ "}{p}
+                </button>
+              );
+            })}
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            <input
+              value={inputVal}
+              onChange={e => setInputVal(e.target.value.toUpperCase())}
+              onKeyDown={e=>{ if(e.key==="Enter"||e.key===","){ e.preventDefault(); if(inputVal.trim()) addPair(inputVal); }}}
+              placeholder="Type a pair e.g. EURUSD and press Enter"
+              style={{ flex:1, background:"#0e1017", border:`1px solid ${C.cardBorder}`, borderRadius:8, padding:"8px 12px", color:C.t1, fontSize:12, outline:"none" }}
+            />
+            <button onClick={()=>{ if(inputVal.trim()) addPair(inputVal); }} style={{ background:C.purple, border:"none", color:"#fff", borderRadius:8, padding:"8px 14px", fontSize:12, fontWeight:700 }}>Add</button>
+          </div>
+          {excluded.length > 0 && (
+            <div style={{ marginTop:12 }}>
+              <div style={{ fontSize:10, color:C.t4, marginBottom:6 }}>Excluded from journal:</div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                {excluded.map(p => (
+                  <div key={p} style={{ display:"flex", alignItems:"center", gap:6, background:"rgba(255,94,108,0.1)", border:"1px solid rgba(255,94,108,0.25)", borderRadius:6, padding:"3px 10px", fontSize:11 }}>
+                    <span style={{ color:C.red, fontWeight:600 }}>{p}</span>
+                    <button onClick={()=>removePair(p)} style={{ background:"none", border:"none", color:C.t4, fontSize:13, lineHeight:1, padding:0 }}>✕</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {excluded.length === 0 && <div style={{ marginTop:10, fontSize:11, color:C.t4 }}>No pairs excluded — all trades will be included.</div>}
+        </div>
+      );
+    }
+
+    // ── Shared: Date Range Panel ──────────────────────────────────────────
+    function DateRangePanel({ startDate, setStartDate, endDate, setEndDate }) {
+      const inputStyle = {
+        flex:1, background:"#0e1017", border:`1px solid ${C.cardBorder}`,
+        borderRadius:8, padding:"8px 12px", color:C.t1, fontSize:12,
+        outline:"none", colorScheme:"dark"
+      };
+      const hasFilter = startDate || endDate;
+      return (
+        <div style={{ background:C.card, border:`1px solid ${hasFilter ? "rgba(245,197,66,0.35)" : C.cardBorder}`, borderRadius:14, padding:"18px 20px", transition:"border-color 0.2s" }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12 }}>
+            <div style={{ fontSize:11, color:C.t3, textTransform:"uppercase", letterSpacing:"0.1em", fontWeight:600 }}>
+              Date Range <span style={{ color:C.t4, fontWeight:400, textTransform:"none", letterSpacing:0 }}>(optional)</span>
+            </div>
+            {hasFilter && (
+              <button
+                onClick={()=>{ setStartDate(""); setEndDate(""); }}
+                style={{ background:"none", border:"none", color:C.t4, fontSize:11, fontWeight:600 }}
+              >
+                Clear
+              </button>
+            )}
+          </div>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+            <div>
+              <div style={{ fontSize:10, color:C.t4, marginBottom:5, letterSpacing:"0.06em" }}>START DATE</div>
+              <input
+                type="date"
+                value={startDate}
+                onChange={e => setStartDate(e.target.value)}
+                style={inputStyle}
+              />
+            </div>
+            <div>
+              <div style={{ fontSize:10, color:C.t4, marginBottom:5, letterSpacing:"0.06em" }}>END DATE</div>
+              <input
+                type="date"
+                value={endDate}
+                onChange={e => setEndDate(e.target.value)}
+                style={inputStyle}
+              />
+            </div>
+          </div>
+          {hasFilter && (
+            <div style={{ marginTop:10, fontSize:11, color:C.yellow, display:"flex", alignItems:"center", gap:6 }}>
+              <span>📅</span>
+              <span>
+                Showing trades
+                {startDate && endDate ? ` from ${startDate} to ${endDate}` : startDate ? ` from ${startDate} onwards` : ` up to ${endDate}`}
+              </span>
+            </div>
+          )}
+          {!hasFilter && (
+            <div style={{ marginTop:10, fontSize:11, color:C.t4 }}>No date filter — all dates in the CSV will be shown.</div>
+          )}
+        </div>
+      );
+    }
+
+    // ── Upload Screen ─────────────────────────────────────────────────────
+    function UploadScreen({ onLoad, onOpenSaved }) {
+      const [recentJournals, setRecentJournals] = useState(() => loadAllJournals());
+      const [mode, setMode]           = useState(null);
+      const [excluded, setExcluded]   = useState([]);
+      const [startDate, setStartDate] = useState("");
+      const [endDate,   setEndDate]   = useState("");
+      const [error, setError]         = useState(null);
+
+      const [indivFile,     setIndivFile]     = useState(null);
+      const [combinedFiles, setCombinedFiles] = useState([]);
+      const [indivDragging, setIndivDragging] = useState(false);
+      const [combDragging,  setCombDragging]  = useState(false);
+      const [success,       setSuccess]       = useState(false);
+
+      const indivRef    = useRef();
+      const combinedRef = useRef();
+
+      const readFile = (file) => new Promise(res => {
+        const r = new FileReader();
+        r.onload = (e) => res(e.target.result);
+        r.readAsText(file);
+      });
+
+      const processIndividual = useCallback(() => {
+        if (!indivFile) return;
+        try {
+          const parsed = parseStatement(indivFile.text, excluded);
+          if (!parsed || parsed.trades.length === 0) { setError("No trades found in this file."); return; }
+          const data = buildJournalData([parsed], startDate, endDate);
+          if (Object.keys(data.dayMap).length === 0) { setError("No trades found in the selected date range."); return; }
+          onLoad(data, excluded, startDate, endDate, "individual", [indivFile.name]);
+          setSuccess(true); setError(null);
+          setRecentJournals(loadAllJournals());
+        } catch(e) { setError("Could not parse the file."); }
+      }, [indivFile, excluded, startDate, endDate, onLoad]);
+
+      const processCombined = useCallback(() => {
+        if (combinedFiles.length < 2) { setError("Please add at least 2 CSV files to combine."); return; }
+        try {
+          const parsed = combinedFiles.map(f => parseStatement(f.text, excluded)).filter(p => p && p.trades.length > 0);
+          if (parsed.length === 0) { setError("No trades found in any of the files."); return; }
+          const data = buildJournalData(parsed, startDate, endDate);
+          if (Object.keys(data.dayMap).length === 0) { setError("No trades found in the selected date range."); return; }
+          onLoad(data, excluded, startDate, endDate, "combined", combinedFiles.map(f => f.name));
+          setSuccess(true); setError(null);
+          setRecentJournals(loadAllJournals());
+        } catch(e) { setError("Could not parse one or more files."); }
+      }, [combinedFiles, excluded, startDate, endDate, onLoad]);
+
+      const handleIndivDrop = async (file) => {
+        if (!file) return; setError(null);
+        const text = await readFile(file);
+        setIndivFile({ name: file.name, text });
+      };
+
+      const handleCombinedAdd = async (files) => {
+        setError(null);
+        const newFiles = await Promise.all(Array.from(files).map(async f => ({ name: f.name, text: await readFile(f) })));
+        setCombinedFiles(prev => {
+          const existing = new Set(prev.map(f => f.name));
+          return [...prev, ...newFiles.filter(f => !existing.has(f.name))];
+        });
+      };
+
+      return (
+        <div style={{ minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:24 }}>
+
+          {/* Logo */}
+          <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:32 }}>
+            <div style={{ width:5, height:44, background:`linear-gradient(180deg,${C.purple},${C.green})`, borderRadius:4 }}/>
+            <div>
+              <div style={{ fontSize:10, color:C.t4, letterSpacing:"0.16em", textTransform:"uppercase" }}>Dark Edge</div>
+              <div style={{ fontSize:26, fontWeight:800, letterSpacing:"-0.02em", color:C.t1 }}>Trading Journal</div>
+            </div>
+          </div>
+
+          <div style={{ width:"100%", maxWidth:540, display:"flex", flexDirection:"column", gap:14 }}>
+
+            {/* Recent journals */}
+            {recentJournals.length > 0 && (
+              <div style={{ background:C.card, border:`1px solid ${C.cardBorder}`, borderRadius:14, padding:"16px 20px" }}>
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12 }}>
+                  <div style={{ fontSize:11, color:C.t3, textTransform:"uppercase", letterSpacing:"0.1em", fontWeight:600 }}>
+                    Recent Journals
+                  </div>
+                  <button
+                    onClick={()=>{
+                      if (confirm("Clear all saved journals?")) {
+                        try { localStorage.removeItem(JOURNALS_KEY); } catch(e){}
+                        setRecentJournals([]);
+                      }
+                    }}
+                    style={{ background:"none", border:"none", color:C.t4, fontSize:11, fontWeight:600 }}
+                  >
+                    Clear all
+                  </button>
+                </div>
+                <div style={{ display:"flex", flexDirection:"column", gap:6, maxHeight:240, overflowY:"auto" }}>
+                  {recentJournals.map(j => {
+                    const accentColor = j.mode === "combined" ? C.green : C.purple;
+                    const dateStr = new Date(j.createdAt).toLocaleDateString(undefined, { month:"short", day:"numeric", hour:"numeric", minute:"2-digit" });
+                    return (
+                      <div key={j.id} style={{
+                        display:"flex", alignItems:"center", justifyContent:"space-between",
+                        background:"#0e1017", border:`1px solid ${C.cardBorder}`,
+                        borderRadius:8, padding:"8px 12px", gap:10
+                      }}>
+                        <button
+                          onClick={()=>onOpenSaved(j.id)}
+                          style={{ flex:1, display:"flex", alignItems:"center", gap:10, background:"none", border:"none", color:C.t1, textAlign:"left", padding:0 }}
+                        >
+                          <div style={{ fontSize:14 }}>{j.mode==="combined" ? "👥" : "👤"}</div>
+                          <div style={{ flex:1, minWidth:0 }}>
+                            <div style={{ fontSize:12, fontWeight:700, color:accentColor, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{j.label}</div>
+                            <div style={{ fontSize:10, color:C.t4, marginTop:1 }}>
+                              {dateStr}
+                              {j.excluded?.length > 0 && ` · Excl: ${j.excluded.join(",")}`}
+                              {(j.startDate || j.endDate) && ` · 📅 filtered`}
+                            </div>
+                          </div>
+                        </button>
+                        <div style={{ display:"flex", gap:4 }}>
+                          <button
+                            onClick={()=>onOpenSaved(j.id)}
+                            style={{ background:"rgba(124,106,247,0.15)", border:"1px solid rgba(124,106,247,0.3)", color:C.purple, borderRadius:6, padding:"4px 10px", fontSize:11, fontWeight:600 }}
+                          >
+                            Open ↗
+                          </button>
+                          <button
+                            onClick={()=>{
+                              if (confirm("Delete this journal?")) {
+                                setRecentJournals(deleteJournal(j.id));
+                              }
+                            }}
+                            style={{ background:"rgba(255,94,108,0.1)", border:"1px solid rgba(255,94,108,0.25)", color:C.red, borderRadius:6, padding:"4px 8px", fontSize:11, fontWeight:600 }}
+                            title="Delete"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div style={{ fontSize:10, color:C.t4, marginTop:10, textAlign:"center" }}>
+                  Click a journal to re-open it in a new tab
+                </div>
+              </div>
+            )}
+
+            {/* Mode selector */}
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+              <button
+                onClick={()=>{ setMode("individual"); setError(null); }}
+                style={{
+                  background: mode==="individual"?"rgba(124,106,247,0.15)":C.card,
+                  border:`2px solid ${mode==="individual"?C.purple:C.cardBorder}`,
+                  borderRadius:14, padding:"20px 16px", textAlign:"left", color:C.t1, transition:"all 0.2s"
+                }}
+              >
+                <div style={{ fontSize:22, marginBottom:8 }}>👤</div>
+                <div style={{ fontSize:15, fontWeight:800, color:mode==="individual"?C.purple:C.t1, marginBottom:4 }}>Individual</div>
+                <div style={{ fontSize:12, color:C.t3, lineHeight:1.5 }}>Load a single broker statement for your own trades.</div>
+                {mode==="individual" && <div style={{ marginTop:10, fontSize:10, color:C.purple, fontWeight:700, letterSpacing:"0.08em" }}>SELECTED ✓</div>}
+              </button>
+              <button
+                onClick={()=>{ setMode("combined"); setError(null); }}
+                style={{
+                  background: mode==="combined"?"rgba(0,212,160,0.1)":C.card,
+                  border:`2px solid ${mode==="combined"?C.green:C.cardBorder}`,
+                  borderRadius:14, padding:"20px 16px", textAlign:"left", color:C.t1, transition:"all 0.2s"
+                }}
+              >
+                <div style={{ fontSize:22, marginBottom:8 }}>👥</div>
+                <div style={{ fontSize:15, fontWeight:800, color:mode==="combined"?C.green:C.t1, marginBottom:4 }}>Combined</div>
+                <div style={{ fontSize:12, color:C.t3, lineHeight:1.5 }}>Merge multiple statements from you and your partners.</div>
+                {mode==="combined" && <div style={{ marginTop:10, fontSize:10, color:C.green, fontWeight:700, letterSpacing:"0.08em" }}>SELECTED ✓</div>}
+              </button>
+            </div>
+
+            {/* Options panels — shown once mode selected */}
+            {mode && (
+              <>
+                <ExcludePanel excluded={excluded} setExcluded={setExcluded}/>
+                <DateRangePanel startDate={startDate} setStartDate={setStartDate} endDate={endDate} setEndDate={setEndDate}/>
+              </>
+            )}
+
+            {/* Individual upload */}
+            {mode === "individual" && (
+              <div>
+                <div
+                  onDragOver={e=>{ e.preventDefault(); setIndivDragging(true); }}
+                  onDragLeave={()=>setIndivDragging(false)}
+                  onDrop={e=>{ e.preventDefault(); setIndivDragging(false); handleIndivDrop(e.dataTransfer.files[0]); }}
+                  onClick={()=>indivRef.current?.click()}
+                  style={{
+                    border:`2px dashed ${indivDragging?C.purple:indivFile?C.purple:C.cardBorder}`,
+                    borderRadius:14, padding:"32px", textAlign:"center", cursor:"pointer",
+                    background: indivDragging?"rgba(124,106,247,0.05)":indivFile?"rgba(124,106,247,0.04)":C.card,
+                    transition:"all 0.2s"
+                  }}
+                >
+                  {indivFile ? (
+                    <div>
+                      <div style={{ fontSize:28, marginBottom:8 }}>✅</div>
+                      <div style={{ fontSize:14, fontWeight:700, color:C.purple }}>{indivFile.name}</div>
+                      <div style={{ fontSize:12, color:C.t3, marginTop:4 }}>Click to replace</div>
+                    </div>
+                  ) : (
+                    <div>
+                      <div style={{ fontSize:32, marginBottom:8 }}>📂</div>
+                      <div style={{ fontSize:15, fontWeight:700, color:C.t1, marginBottom:4 }}>Drop your CSV here</div>
+                      <div style={{ fontSize:12, color:C.t3, marginBottom:16 }}>or click to browse</div>
+                      <div style={{ display:"inline-block", background:C.purple, color:"#fff", borderRadius:8, padding:"9px 24px", fontSize:13, fontWeight:700 }}>Choose File</div>
+                    </div>
+                  )}
+                  <input ref={indivRef} type="file" accept=".csv,.txt" style={{ display:"none" }} onChange={e=>handleIndivDrop(e.target.files[0])}/>
+                </div>
+                {indivFile && (
+                  <button onClick={processIndividual} style={{ width:"100%", marginTop:10, background:C.purple, border:"none", color:"#fff", borderRadius:10, padding:"14px", fontSize:14, fontWeight:800 }}>
+                    Load Journal →
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Combined upload */}
+            {mode === "combined" && (
+              <div>
+                <div
+                  onDragOver={e=>{ e.preventDefault(); setCombDragging(true); }}
+                  onDragLeave={()=>setCombDragging(false)}
+                  onDrop={e=>{ e.preventDefault(); setCombDragging(false); handleCombinedAdd(e.dataTransfer.files); }}
+                  onClick={()=>combinedRef.current?.click()}
+                  style={{
+                    border:`2px dashed ${combDragging?C.green:C.cardBorder}`,
+                    borderRadius:14, padding:"28px", textAlign:"center", cursor:"pointer",
+                    background: combDragging?"rgba(0,212,160,0.05)":C.card, transition:"all 0.2s"
+                  }}
+                >
+                  <div style={{ fontSize:32, marginBottom:8 }}>📂</div>
+                  <div style={{ fontSize:15, fontWeight:700, color:C.t1, marginBottom:4 }}>Drop CSV files here</div>
+                  <div style={{ fontSize:12, color:C.t3, marginBottom:16 }}>Drop multiple files at once, or add one by one</div>
+                  <div style={{ display:"inline-block", background:C.green, color:"#0e1017", borderRadius:8, padding:"9px 24px", fontSize:13, fontWeight:800 }}>Add Files</div>
+                  <input ref={combinedRef} type="file" accept=".csv,.txt" multiple style={{ display:"none" }} onChange={e=>handleCombinedAdd(e.target.files)}/>
+                </div>
+
+                {combinedFiles.length > 0 && (
+                  <div style={{ marginTop:12, background:C.card, border:`1px solid ${C.cardBorder}`, borderRadius:12, overflow:"hidden" }}>
+                    <div style={{ padding:"10px 14px", borderBottom:`1px solid ${C.cardBorder}`, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                      <div style={{ fontSize:11, color:C.t3, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.08em" }}>{combinedFiles.length} file{combinedFiles.length!==1?"s":""} queued</div>
+                      <button onClick={()=>setCombinedFiles([])} style={{ background:"none", border:"none", color:C.t4, fontSize:11 }}>Clear all</button>
+                    </div>
+                    {combinedFiles.map((f,i) => (
+                      <div key={i} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"10px 14px", borderBottom:i<combinedFiles.length-1?`1px solid ${C.cardBorder}`:"none" }}>
+                        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                          <div style={{ width:28, height:28, background:"rgba(0,212,160,0.1)", border:"1px solid rgba(0,212,160,0.2)", borderRadius:6, display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>📄</div>
+                          <div>
+                            <div style={{ fontSize:13, color:C.t1, fontWeight:600 }}>{f.name}</div>
+                            <div style={{ fontSize:10, color:C.t4 }}>Account {i+1}</div>
+                          </div>
+                        </div>
+                        <button onClick={()=>setCombinedFiles(prev=>prev.filter((_,j)=>j!==i))} style={{ background:"rgba(255,94,108,0.1)", border:"1px solid rgba(255,94,108,0.2)", color:C.red, borderRadius:6, padding:"4px 10px", fontSize:11, fontWeight:600 }}>Remove</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {combinedFiles.length >= 2 && (
+                  <button onClick={processCombined} style={{ width:"100%", marginTop:10, background:C.green, border:"none", color:"#0e1017", borderRadius:10, padding:"14px", fontSize:14, fontWeight:800 }}>
+                    Combine & Load Journal →
+                  </button>
+                )}
+                {combinedFiles.length === 1 && (
+                  <div style={{ marginTop:10, fontSize:12, color:C.t4, textAlign:"center" }}>Add at least one more file to combine.</div>
+                )}
+              </div>
+            )}
+
+            {success && (
+              <div style={{ background:"rgba(0,212,160,0.08)", border:"1px solid rgba(0,212,160,0.3)", borderRadius:10, padding:"12px 16px", display:"flex", alignItems:"center", justifyContent:"space-between", gap:10 }}>
+                <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                  <div style={{ fontSize:18 }}>✅</div>
+                  <div>
+                    <div style={{ fontSize:13, fontWeight:700, color:C.green }}>Journal opened in a new tab</div>
+                    <div style={{ fontSize:11, color:C.t3, marginTop:1 }}>If nothing opened, check your popup blocker and try again.</div>
+                  </div>
+                </div>
+                <button
+                  onClick={()=>setSuccess(false)}
+                  style={{ background:"none", border:`1px solid ${C.cardBorder}`, color:C.t3, borderRadius:6, padding:"5px 10px", fontSize:11, fontWeight:600 }}
+                >
+                  Load another
+                </button>
+              </div>
+            )}
+            {error && <div style={{ color:C.red, fontSize:13, textAlign:"center", padding:"8px 0" }}>{error}</div>}
+            {mode && <div style={{ fontSize:11, color:C.t4, textAlign:"center", lineHeight:1.7 }}>Your CSV files never leave your browser — processed entirely locally.</div>}
+          </div>
+        </div>
+      );
+    }
+
+    // ── Journal View ──────────────────────────────────────────────────────
+    function JournalView({ data, excluded, startDate, endDate, mode, fileNames, onReset }) {
+      const { dayMap, cumLine, trades, openingBalance } = data;
+      const [month, setMonth] = useState(data.initMonth);
+      const [year,  setYear]  = useState(data.initYear);
+      const today = new Date();
+
+      const stats = useMemo(() => {
+        const pfx = `${year}-${String(month+1).padStart(2,"0")}`;
+        const entries = Object.entries(dayMap).filter(([k])=>k.startsWith(pfx)).map(([,v])=>v);
+        const tradeDays = entries.filter(d=>d.trades>0);
+        const winning   = tradeDays.filter(d=>d.pnl>0);
+        const losing    = tradeDays.filter(d=>d.pnl<0);
+        const totalPnl  = entries.reduce((s,d)=>s+d.pnl,0);
+        const winRate   = tradeDays.length?(winning.length/tradeDays.length)*100:0;
+        const avgWin    = winning.length?winning.reduce((s,d)=>s+d.pnl,0)/winning.length:0;
+        const avgLoss   = losing.length?losing.reduce((s,d)=>s+d.pnl,0)/losing.length:0;
+        const grossWin  = winning.reduce((s,d)=>s+d.pnl,0);
+        const grossLoss = Math.abs(losing.reduce((s,d)=>s+d.pnl,0));
+        const pf        = grossLoss?grossWin/grossLoss:grossWin>0?9.99:0;
+        const totalTrades = entries.reduce((s,d)=>s+d.trades,0);
+        const closingBal  = openingBalance + Object.values(dayMap).reduce((s,d)=>s+d.pnl,0);
+        const scores = [
+          Math.min(100,winRate), Math.min(100,pf*20),
+          tradeDays.length>=4?75:50,
+          avgLoss!==0?Math.min(100,(Math.abs(avgWin)/Math.abs(avgLoss))*40):50,
+          75, 68,
+        ];
+        return { totalPnl, winRate, avgWin, avgLoss, pf, totalTrades, tradeDays:tradeDays.length, scores, closingBal };
+      }, [month, year, dayMap]);
+
+      const calDays = useMemo(() => {
+        const first = new Date(year,month,1).getDay();
+        const total = new Date(year,month+1,0).getDate();
+        const cells = Array(first).fill(null);
+        for (let i=1;i<=total;i++) cells.push(i);
+        while (cells.length%7) cells.push(null);
+        return cells;
+      }, [month, year]);
+
+      const getDayData = (d) => {
+        if (!d) return null;
+        return dayMap[`${year}-${String(month+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`]??null;
+      };
+
+      const weeks = useMemo(() => Array.from({length:calDays.length/7},(_,w) => {
+        let pnl=0, days=0;
+        calDays.slice(w*7,w*7+7).forEach(d => {
+          const data=getDayData(d); if(data){ pnl+=data.pnl; if(data.trades>0)days++; }
+        });
+        return { pnl, days, num:w+1 };
+      }), [calDays, month, year]);
+
+      const monthTrades = useMemo(() => {
+        const pfx = `${year}-${String(month+1).padStart(2,"0")}`;
+        return trades.filter(t => t.date.startsWith(pfx));
+      }, [trades, month, year]);
+
+      const labelStyle = { fontSize:9, color:C.t3, textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:4 };
+      const cardStyle  = { background:C.card, border:`1px solid ${C.cardBorder}`, borderRadius:10, padding:"12px 14px" };
+      const btnStyle   = { background:"#1a1d26", border:`1px solid ${C.cardBorder}`, color:C.t2, borderRadius:6, width:26, height:26, fontSize:14, display:"flex", alignItems:"center", justifyContent:"center" };
+      const accentColor = mode === "combined" ? C.green : C.purple;
+      const hasDateFilter = startDate || endDate;
+
+      return (
+        <div style={{ background:C.bg, minHeight:"100vh", padding:"14px 16px" }}>
+         <div style={{ maxWidth:1400, margin:"0 auto" }}>
+
+          {/* Header */}
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+              <div style={{ width:4, height:36, background:`linear-gradient(180deg,${accentColor},${C.green})`, borderRadius:4 }}/>
+              <div>
+                <div style={{ fontSize:9, color:C.t4, letterSpacing:"0.14em", textTransform:"uppercase" }}>Dark Edge</div>
+                <div style={{ fontSize:20, fontWeight:800, letterSpacing:"-0.02em", lineHeight:1, color:C.t1 }}>Trading Journal</div>
+              </div>
+            </div>
+            <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap", justifyContent:"flex-end" }}>
+              <div style={{ background:mode==="combined"?"rgba(0,212,160,0.1)":"rgba(124,106,247,0.1)", border:`1px solid ${mode==="combined"?"rgba(0,212,160,0.25)":"rgba(124,106,247,0.25)"}`, borderRadius:8, padding:"5px 12px", fontSize:11, color:accentColor, fontWeight:700 }}>
+                {mode==="combined"?"👥 Combined":"👤 Individual"}
+              </div>
+              <div style={{ background:C.card, border:`1px solid ${C.cardBorder}`, borderRadius:8, padding:"5px 12px", fontSize:11, color:C.t2 }}>
+                {MONTHS[month]} {year}
+                {excluded.length>0 && <span style={{ color:C.t4 }}> · Excl: {excluded.join(", ")}</span>}
+              </div>
+              <button onClick={onReset} style={{ background:"#1a1d26", border:`1px solid ${C.cardBorder}`, color:C.t2, borderRadius:8, padding:"5px 14px", fontSize:11, fontWeight:600 }}>← New CSV</button>
+            </div>
+          </div>
+
+          {/* Date range + combined file bar */}
+          {(hasDateFilter || mode === "combined") && (
+            <div style={{ display:"flex", gap:8, marginBottom:10, flexWrap:"wrap", alignItems:"center" }}>
+              {hasDateFilter && (
+                <div style={{ background:"rgba(245,197,66,0.08)", border:"1px solid rgba(245,197,66,0.25)", borderRadius:8, padding:"5px 12px", fontSize:11, color:C.yellow, display:"flex", alignItems:"center", gap:6 }}>
+                  <span>📅</span>
+                  <span>
+                    {startDate && endDate ? `${startDate} → ${endDate}` : startDate ? `From ${startDate}` : `Up to ${endDate}`}
+                  </span>
+                </div>
+              )}
+              {mode === "combined" && fileNames.map((n,i) => (
+                <div key={i} style={{ background:"rgba(0,212,160,0.07)", border:"1px solid rgba(0,212,160,0.15)", borderRadius:6, padding:"4px 10px", fontSize:11, color:C.green }}>
+                  📄 {n}
+                </div>
+              ))}
+              {mode === "combined" && (
+                <div style={{ background:C.card, border:`1px solid ${C.cardBorder}`, borderRadius:6, padding:"4px 10px", fontSize:11, color:C.t3 }}>
+                  {fileNames.length} accounts merged
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Stat cards */}
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:10, marginBottom:12 }}>
+            <div style={cardStyle}>
+              <div style={labelStyle}>Net P&L</div>
+              <div style={{ fontSize:22, fontWeight:800, color:stats.totalPnl>=0?C.green:C.red, fontFamily:"'JetBrains Mono',monospace" }}>{fmtPlain(stats.totalPnl)}</div>
+              <div style={{ fontSize:10, color:C.t3, marginTop:3 }}>Balance: <span style={{ color:C.t2, fontWeight:600 }}>${stats.closingBal.toFixed(2)}</span></div>
+            </div>
+            <div style={cardStyle}>
+              <div style={labelStyle}>Trade Win %</div>
+              <div style={{ fontSize:22, fontWeight:800, color:C.t1, fontFamily:"'JetBrains Mono',monospace" }}>{stats.winRate.toFixed(1)}%</div>
+              <div style={{ height:4, background:"#1a1d26", borderRadius:2, marginTop:8, overflow:"hidden" }}>
+                <div style={{ width:`${stats.winRate}%`, height:"100%", background:`linear-gradient(90deg,${C.red},${C.yellow},${C.green})`, borderRadius:2 }}/>
+              </div>
+            </div>
+            <div style={cardStyle}>
+              <div style={labelStyle}>Avg Win / Loss</div>
+              <div style={{ display:"flex", gap:10, alignItems:"baseline" }}>
+                <span style={{ fontSize:15, fontWeight:700, color:C.green, fontFamily:"'JetBrains Mono',monospace" }}>{fmtPlain(stats.avgWin)}</span>
+                <span style={{ fontSize:15, fontWeight:700, color:C.red,   fontFamily:"'JetBrains Mono',monospace" }}>{fmtPlain(stats.avgLoss)}</span>
+              </div>
+              <div style={{ height:4, background:"#1a1d26", borderRadius:2, marginTop:8, overflow:"hidden", display:"flex" }}>
+                <div style={{ width:`${stats.avgLoss!==0?(Math.abs(stats.avgWin)/(Math.abs(stats.avgWin)+Math.abs(stats.avgLoss)))*100:50}%`, background:C.green }}/>
+                <div style={{ flex:1, background:C.red }}/>
+              </div>
+            </div>
+            <div style={cardStyle}>
+              <div style={labelStyle}>Profit Factor</div>
+              <div style={{ fontSize:22, fontWeight:800, color:stats.pf>=2?C.green:stats.pf>=1?C.yellow:C.red, fontFamily:"'JetBrains Mono',monospace" }}>{stats.pf.toFixed(2)}</div>
+              <div style={{ fontSize:10, color:C.t3, marginTop:3 }}>{stats.pf>=2?"Excellent":stats.pf>=1.5?"Good":stats.pf>=1?"Marginal":"Poor"}</div>
+            </div>
+            <div style={cardStyle}>
+              <div style={labelStyle}>Trades</div>
+              <div style={{ fontSize:22, fontWeight:800, color:C.t1, fontFamily:"'JetBrains Mono',monospace" }}>{stats.totalTrades}</div>
+              <div style={{ fontSize:10, color:C.t3, marginTop:3 }}><span style={{ color:C.t2 }}>{stats.tradeDays}</span> trading days</div>
+            </div>
+          </div>
+
+          {/* Body */}
+          <div style={{ display:"flex", gap:12, alignItems:"stretch" }}>
+            <div style={{ width:320, flexShrink:0, display:"flex", flexDirection:"column", gap:10 }}>
+              <div style={{ ...cardStyle, padding:18 }}>
+                <div style={labelStyle}>Cumulative P&L</div>
+                <SparkLine data={cumLine} openingBalance={openingBalance}/>
+              </div>
+              <div style={{ ...cardStyle, padding:18, flex:1 }}>
+                <div style={labelStyle}>Zella Score</div>
+                <RadarChart scores={stats.scores}/>
+              </div>
+            </div>
+
+            {/* Calendar */}
+            <div style={{ flex:1, ...cardStyle, padding:14, display:"flex", flexDirection:"column" }}>
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12 }}>
+                <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                  <button style={btnStyle} onClick={()=>{ let m=month-1,y=year; if(m<0){m=11;y--;} setMonth(m);setYear(y); }}>‹</button>
+                  <span style={{ fontWeight:700, fontSize:15, color:C.t1 }}>{MONTHS[month]} {year}</span>
+                  <button style={btnStyle} onClick={()=>{ let m=month+1,y=year; if(m>11){m=0;y++;} setMonth(m);setYear(y); }}>›</button>
+                </div>
+                <div style={{ fontSize:11, color:C.t3 }}>
+                  Monthly: <span style={{ color:stats.totalPnl>=0?C.green:C.red, fontWeight:700, fontFamily:"'JetBrains Mono',monospace" }}>{fmtPlain(stats.totalPnl)}</span>
+                  <span style={{ marginLeft:10, color:C.t2 }}>{stats.tradeDays} days</span>
+                </div>
+              </div>
+
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(7,1fr) 88px", gap:4, marginBottom:6 }}>
+                {DAYS.map(d => <div key={d} style={{ fontSize:10, color:C.t3, textAlign:"center", paddingBottom:4, textTransform:"uppercase", letterSpacing:"0.07em", fontWeight:600 }}>{d}</div>)}
+                <div style={{ fontSize:10, color:C.t3, textAlign:"center", paddingBottom:4, fontWeight:600 }}>WEEK</div>
+              </div>
+
+              <div style={{ flex:1, display:"flex", flexDirection:"column", gap:4 }}>
+                {Array.from({length:calDays.length/7},(_,w) => (
+                  <div key={w} style={{ flex:1, display:"grid", gridTemplateColumns:"repeat(7,1fr) 88px", gap:4 }}>
+                    {calDays.slice(w*7,w*7+7).map((d,i) => {
+                      const isToday = d&&today.getDate()===d&&today.getMonth()===month&&today.getFullYear()===year;
+                      return <CalendarCell key={i} day={d} data={getDayData(d)} isToday={isToday}/>;
+                    })}
+                    <div style={{ background:"#0e1017", border:`1px solid #1a1d26`, borderRadius:8, padding:"5px 8px", display:"flex", flexDirection:"column", justifyContent:"center", alignItems:"flex-end" }}>
+                      <div style={{ fontSize:9, color:C.t4, marginBottom:2 }}>Week {weeks[w]?.num}</div>
+                      <div style={{ fontSize:13, fontWeight:700, fontFamily:"'JetBrains Mono',monospace", color:(weeks[w]?.pnl||0)>0?C.green:(weeks[w]?.pnl||0)<0?C.red:C.t4 }}>
+                        {weeks[w]?.days?fmtK(weeks[w].pnl):"$0"}
+                      </div>
+                      <div style={{ fontSize:9, color:C.t3, marginTop:1 }}>{weeks[w]?.days||0} day{weeks[w]?.days!==1?"s":""}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Trade log */}
+          <div style={{ ...cardStyle, marginTop:12 }}>
+            <div style={{ ...labelStyle, marginBottom:10 }}>
+              Trade Log · {MONTHS[month]} {year}
+              {mode==="combined"?` · ${fileNames.length} accounts`:""}
+              {hasDateFilter && <span style={{ color:C.yellow }}> · Date filtered</span>}
+            </div>
+            {monthTrades.length === 0
+              ? <div style={{ color:C.t4, fontSize:13, padding:"12px 0" }}>No trades this month. Navigate to a month with trades.</div>
+              : (
+                <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+                  <thead>
+                    <tr>
+                      {["Date","Market","Lots","Direction","P&L"].map(h=>(
+                        <th key={h} style={{ textAlign:"left", color:C.t3, fontWeight:600, fontSize:10, textTransform:"uppercase", letterSpacing:"0.08em", paddingBottom:8, borderBottom:`1px solid ${C.cardBorder}` }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {monthTrades.map((t,i)=>(
+                      <tr key={i} style={{ borderBottom:`1px solid #191c24` }}>
+                        <td style={{ padding:"8px 0", color:C.t2 }}>{t.date}</td>
+                        <td style={{ color:C.t1, fontWeight:700 }}>{t.market}</td>
+                        <td style={{ color:C.t2 }}>{t.lots}</td>
+                        <td style={{ color:t.dir==="Buy"?C.blue:C.amber, fontWeight:600 }}>{t.dir}</td>
+                        <td style={{ color:t.pnl>0?C.green:C.red, fontFamily:"'JetBrains Mono',monospace", fontWeight:700 }}>{fmtPlain(t.pnl)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )
+            }
+          </div>
+         </div>
+        </div>
+      );
+    }
+
+    // ── App ───────────────────────────────────────────────────────────────
+    const JOURNALS_KEY = "tradingJournalSaved";  // stores array of saved journals
+
+    // Storage helpers
+    function loadAllJournals() {
+      try {
+        const raw = localStorage.getItem(JOURNALS_KEY);
+        return raw ? JSON.parse(raw) : [];
+      } catch (e) { return []; }
+    }
+    function saveJournal(journal) {
+      const all = loadAllJournals();
+      // Keep at most 20 most recent
+      const next = [journal, ...all.filter(j => j.id !== journal.id)].slice(0, 20);
+      try { localStorage.setItem(JOURNALS_KEY, JSON.stringify(next)); } catch (e) {}
+      return next;
+    }
+    function deleteJournal(id) {
+      const next = loadAllJournals().filter(j => j.id !== id);
+      try { localStorage.setItem(JOURNALS_KEY, JSON.stringify(next)); } catch (e) {}
+      return next;
+    }
+    function getJournal(id) {
+      return loadAllJournals().find(j => j.id === id) || null;
+    }
+
+    function App() {
+      // Parse hash — format: #journal=<id>
+      const hash = typeof window !== "undefined" ? window.location.hash : "";
+      const journalIdFromHash = hash.startsWith("#journal=") ? hash.slice(9) : null;
+      const isResultTab = journalIdFromHash !== null;
+
+      const [initialPayload] = useState(() => {
+        if (!isResultTab) return null;
+        return getJournal(journalIdFromHash);
+      });
+
+      const [journalData, setJournalData] = useState(initialPayload?.data || null);
+      const [excluded,    setExcluded]    = useState(initialPayload?.excluded || []);
+      const [startDate,   setStartDate]   = useState(initialPayload?.startDate || "");
+      const [endDate,     setEndDate]     = useState(initialPayload?.endDate   || "");
+      const [mode,        setMode]        = useState(initialPayload?.mode      || null);
+      const [fileNames,   setFileNames]   = useState(initialPayload?.fileNames || []);
+
+      // Detect mobile — on mobile, new tabs are clunky; show inline instead
+      const isMobile = typeof window !== "undefined" && (
+        /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
+        (window.matchMedia && window.matchMedia("(max-width: 768px)").matches)
+      );
+
+      // Upload screen — save and open in new tab (desktop) or inline (mobile)
+      const handleLoad = (data, exc, sd, ed, m, names) => {
+        const id = `j${Date.now()}${Math.random().toString(36).slice(2,7)}`;
+        const label = names.length === 1 ? names[0].replace(/\.csv$/i, "") : `${names.length} accounts · ${names[0].replace(/\.csv$/i, "")}`;
+        const journal = {
+          id, label, mode: m, fileNames: names,
+          data, excluded: exc, startDate: sd, endDate: ed,
+          createdAt: Date.now(),
+        };
+        saveJournal(journal);
+
+        // On mobile: always show inline (new tabs are awkward + storage issues)
+        if (isMobile) {
+          setJournalData(data); setExcluded(exc);
+          setStartDate(sd); setEndDate(ed);
+          setMode(m); setFileNames(names);
+          return;
+        }
+
+        // On desktop: open in new tab
+        const url = window.location.origin + window.location.pathname + "#journal=" + id;
+        const w = window.open(url, "_blank");
+        if (!w || w.closed || typeof w.closed === "undefined") {
+          // Popup blocked — show inline as fallback
+          setJournalData(data); setExcluded(exc);
+          setStartDate(sd); setEndDate(ed);
+          setMode(m); setFileNames(names);
+        }
+      };
+
+      // Re-open a saved journal — inline on mobile, new tab on desktop
+      const handleOpenSaved = (id) => {
+        if (isMobile) {
+          const saved = getJournal(id);
+          if (saved) {
+            setJournalData(saved.data);
+            setExcluded(saved.excluded || []);
+            setStartDate(saved.startDate || "");
+            setEndDate(saved.endDate || "");
+            setMode(saved.mode || null);
+            setFileNames(saved.fileNames || []);
+          }
+          return;
+        }
+        const url = window.location.origin + window.location.pathname + "#journal=" + id;
+        window.open(url, "_blank");
+      };
+
+      const handleReset = () => {
+        if (isResultTab) {
+          window.close();
+        } else {
+          setJournalData(null); setExcluded([]);
+          setStartDate(""); setEndDate("");
+          setMode(null); setFileNames([]);
+        }
+      };
+
+      // Result tab but journal not found in storage
+      if (isResultTab && !journalData) {
+        return (
+          <div style={{ minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center", padding:24, textAlign:"center" }}>
+            <div>
+              <div style={{ fontSize:40, marginBottom:12 }}>🔍</div>
+              <div style={{ fontSize:16, fontWeight:700, color:C.t1, marginBottom:8 }}>Journal not found</div>
+              <div style={{ fontSize:13, color:C.t3, marginBottom:20 }}>This journal may have been cleared from browser storage.</div>
+              <button
+                onClick={()=>{ window.location.hash = ""; window.location.reload(); }}
+                style={{ background:C.purple, border:"none", color:"#fff", borderRadius:8, padding:"10px 20px", fontSize:13, fontWeight:700 }}
+              >
+                Go to upload
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      return journalData
+        ? <JournalView data={journalData} excluded={excluded} startDate={startDate} endDate={endDate} mode={mode} fileNames={fileNames} onReset={handleReset}/>
+        : <UploadScreen onLoad={handleLoad} onOpenSaved={handleOpenSaved}/>;
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  </script>
+</body>
+</html>
